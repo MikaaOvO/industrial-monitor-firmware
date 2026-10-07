@@ -1,0 +1,36 @@
+# ===== STM32CubeMX + CMake 工程（cube-cmake / Ninja 构建） =====
+
+# ---- 构建产物 ----
+/build/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.su
+*.a
+*.lib
+
+# ---- CubeMX 临时文件 ----
+mx.scratch
+
+# ---- clangd 索引缓存（.clangd 配置文件本身保留提交） ----
+.cache/
+compile_commands.json
+
+# ---- IDE（.vscode/、.settings/ 由 STM32Cube 插件生成，建议提交以便换机复用；下面是纯个人 IDE） ----
+.idea/
+*.code-workspace
+
+# ---- 日志 / 临时 / 编辑器备份 ----
+*.log
+*.tmp
+*.swp
+*~
+
+# ---- 系统文件 ----
+Thumbs.db
+.DS_Store
+Desktop.ini
