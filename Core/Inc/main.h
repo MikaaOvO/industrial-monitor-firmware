@@ -63,6 +63,8 @@ void Error_Handler(void);
 #define T_IRQ_GPIO_Port GPIOB
 #define T_CS_Pin GPIO_PIN_12
 #define T_CS_GPIO_Port GPIOB
+#define RS485_DE_Pin GPIO_PIN_8
+#define RS485_DE_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 

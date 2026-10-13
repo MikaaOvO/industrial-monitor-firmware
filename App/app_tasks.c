@@ -4,13 +4,9 @@
 #include "voc.h"
 #include "host_proto.h"
 #include "indicator.h"
-#include "main.h"       /* HAL 类型 + HAL_UART_Transmit */
 #include "cmsis_os.h"
 #include "FreeRTOS.h"   /* configASSERT 在 FreeRTOSConfig.h 里 */
 #include "lvgl.h"
-
-/* CubeMX 把句柄定义在 Core/Src/main.c 里，main.h 没有 extern 声明 */
-extern UART_HandleTypeDef huart2;
 
 /* ================================================================
  * 任务骨架
@@ -38,7 +34,8 @@ extern UART_HandleTypeDef huart2;
  * ---------------------------------------------------------------- */
 #define STACK_SENSOR    (384 * 4)    /* 1.5KB：ADC 读数 + 浮点换算      */
 #define STACK_VOC       (384 * 4)    /* 1.5KB：12 字节帧解析            */
-#define STACK_HOST      (512 * 4)    /* 2.0KB：snprintf 组帧吃栈较多    */
+#define STACK_HOST      (640 * 4)    /* 2.5KB：要给两条链路各组一帧，
+                                        snprintf 走 %s 路径吃栈较多 */
 #define STACK_OUTPUT    (384 * 4)    /* 1.5KB：只算几个数、写寄存器     */
 
 /* ----------------------------------------------------------------
@@ -190,63 +187,78 @@ void Task_Voc(void *argument)
 }
 
 /* ================================================================
- * 上位机通信（USART2，PA2=TX / PA3=RX，115200 8N1，接 CH340）
+ * 上位机通信 —— 两条链路跑同一套协议
+ *
+ *   UART_LINK_DEBUG —— USART2 (PA2/PA3) + CH340     下位机调试用
+ *   UART_LINK_BUS   —— USART6 (PC6/PC7) + MAX3485   上位机 RS485 总线
  *
  * 帧格式、字段含义、校验算法都在 App/host_proto.c 里。这个任务只负责：
  *
- *   进循环前：host_start() 启动接收中断（之后中断自维持，见 uart_rx.c）
- *   循环里：  ① 收到整行就解析，成功的命令写回共享 cfg
- *             ② 每 HOST_SEND_MS 组一帧遥测发出去
+ *   进循环前：host_start() 给两条链路各启动一次接收中断
+ *             （之后中断自维持，见 uart_rx.c）
+ *   循环里：  ① 两条链路各取整行、解析，成功的命令写回共享 cfg
+ *             ② 每 HOST_SEND_MS 在两条链路各发一帧遥测
  *
  * ---- 收发为什么不对称 ----
- *   收必须靠中断：115200 下一个字节只有 87µs，20ms 轮询一次中间会到
- *   200 多个字节，只能捞到 1 个，一帧都收不全。
- *   发是主动的、每 500ms 一次，用阻塞发送最简单 —— 80 字节在 115200 下
- *   约 7ms，相对于 500ms 周期可以接受，而且这段时间正好不会去抢 LVGL。
+ *   收必须靠中断：115200 下一个字节只有 87µs，5ms 轮询一次中间会到
+ *   50 多个字节，只能捞到 1 个，一帧都收不全。
+ *   发是主动的、每 500ms 一次，用阻塞发送最简单 —— 一帧约 200 字节在
+ *   115200 下约 17ms，相对于 500ms 周期可以接受。
+ *   RS485 那条链路的 DE 方向控制就包在 uart_tx_send() 里，靠阻塞发送
+ *   内部的 TC 等待保证时序（见 uart_rx.c 的注释）。
  *
  * ---- 边界 ----
  *   收到阈值后写 cfg_set() 就行，界面会在 200ms 内自己同步过来。
  *   这个任务**不要碰任何 lv_* 函数**（LVGL 不是线程安全的）。
  * ================================================================ */
 
-/* 循环周期。取 5ms 而不是 20ms 的原因：行缓冲只有一个槽位，如果两条命令
-   在同一个轮询窗口内都收满，前一条会被后一条覆盖掉。115200 下一条 40 字节
-   的命令约 3.5ms，两条之间至少隔 7ms，所以 5ms 的窗口里塞不下两条 ——
-   这样"上位机连着发多条命令"就不会丢。
-   （代价是每秒 200 次唤醒，每次只查一个标志位，可以忽略。） */
+/* 循环周期。取 5ms 而不是 20ms 的原因：每条链路的行缓冲只有一个槽位，
+   如果两条命令在同一个轮询窗口内都收满，前一条会被后一条覆盖掉。
+   115200 下一条 40 字节的命令约 3.5ms，两条之间至少隔 7ms，所以 5ms
+   的窗口里塞不下两条 —— 这样"上位机连着发多条命令"就不会丢。
+   （代价是每秒 200 次唤醒，每次只查几个标志位，可以忽略。） */
 #define HOST_POLL_MS     5
 #define HOST_SEND_MS     500    /* 遥测上报周期 */
-#define HOST_TX_TIMEOUT  100    /* 阻塞发送的超时 ms */
 #define HOST_NODE_ID     1      /* 节点号。现在恒为 1，给 RS485 组网预留 */
 
 void Task_Host(void *argument)
 {
     (void)argument;
 
-    bool uart_ok = host_start();
-    configASSERT(uart_ok);      /* 失败十有八九是 CubeMX 里 USART2 的中断没勾 */
-    (void)uart_ok;
+    /* 两条链路的接收中断各启动一次。失败十有八九是 CubeMX 里那个串口的
+       全局中断没勾 —— uart_rx.c 里显式查了 NVIC 才拦得住。 */
+    for (int lk = 0; lk < UART_LINK_COUNT; lk++) {
+        bool ok = host_start(lk);
+        configASSERT(ok);
+        (void)ok;
+    }
 
-    /* 帧缓冲放静态区，别放栈上 —— Task_Host 的栈只有 2KB，
-       192 字节的帧加上 printf 系的内部占用会很紧张。 */
+    /* 帧缓冲放静态区，别放栈上 —— Task_Host 的栈只有 2.5KB，
+       256 字节的帧加上 printf 系的内部占用会很紧张。 */
     static char txbuf[HOST_TX_BUF_LEN];
-    char line[HOST_RX_LINE_LEN];
 
     uint32_t since_send = 0;
 
     for (;;) {
-        /* ---- ① 收：有整行就解析 ---- */
-        if (host_take_line(line, sizeof line)) {
-            cfg_t c;
-            cfg_get(&c);
-            if (host_parse_cmd(line, &c)) {
-                cfg_set(&c);        /* 校验通过的合法命令才写回去 */
+        /* ---- ① 收：两条链路都看 ---- */
+        for (int lk = 0; lk < UART_LINK_COUNT; lk++) {
+
+            char one[HOST_RX_LINE_LEN];
+            while (host_take_line(lk, one, sizeof one)) {
+
+                cfg_t c;
+                cfg_get(&c);
+                /* 校验通过的合法命令才写回去。
+                   node 不匹配的帧这里就返回 false，什么都不会改。 */
+                if (host_parse_cmd(one, HOST_NODE_ID, &c)) {
+                    cfg_set(&c);
+                }
+                /* 解析失败（校验错、格式错、node 不对）就无声丢弃。
+                   不要在失败时去改 cfg —— 一帧被干扰的命令绝不能改坏一半参数。 */
             }
-            /* 解析失败（校验错、格式错）就无声丢弃。
-               不要在失败时去改 cfg —— 一帧被干扰的命令绝不能改坏一半参数。 */
         }
 
-        /* ---- ② 发：每 HOST_SEND_MS 一帧遥测 ---- */
+        /* ---- ② 发：每 HOST_SEND_MS 在两条链路各发一帧 ---- */
         since_send += HOST_POLL_MS;
         if (since_send >= HOST_SEND_MS) {
             since_send = 0;
@@ -256,12 +268,18 @@ void Task_Host(void *argument)
             env_get(&e);
             cfg_get(&c);
 
-            int n = host_build_telemetry(txbuf, sizeof txbuf, HOST_NODE_ID, &e, &c);
-            if (n > 0) {
-                HAL_UART_Transmit(&huart2, (uint8_t *)txbuf, (uint16_t)n, HOST_TX_TIMEOUT);
+            for (int lk = 0; lk < UART_LINK_COUNT; lk++) {
+                /* 两条链路的收发是独立的，所以同一时刻组出来的两帧内容
+                   不完全相同 —— RXB/RXL/RXO 各自报自己那条链路的接收情况。
+                   这是有意的：你从哪个口收到，报的就是那个口的链路状态。 */
+                int n = host_build_telemetry(txbuf, sizeof txbuf,
+                                             HOST_NODE_ID, lk, &e, &c);
+                if (n > 0) {
+                    /* 发不出去（超时）不做重试：500ms 后本来就有下一帧，
+                       重试只会把过期的数据补发一遍。 */
+                    uart_tx_send(lk, (const uint8_t *)txbuf, (uint16_t)n);
+                }
             }
-            /* 发送失败（超时）不做重试：500ms 后本来就有下一帧，
-               重试只会把过期的数据补发一遍。 */
         }
 
         osDelay(HOST_POLL_MS);
