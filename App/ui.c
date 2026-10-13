@@ -22,6 +22,20 @@ extern lv_font_t lv_font_zh_20;
  * 反面例子：不要在别的任务里直接调 lv_label_set_text()，会花屏或死机。
  * ================================================================ */
 
+/* ================================================================
+ * 【临时调试开关】测 21VOC 的上报间隔 —— 排完设回 0 就恢复原样
+ *
+ * 打开后，"CO2"卡改显示通过校验的帧数（温度和湿度卡照常显示真值）。
+ *
+ * 用法：记下 CO2 卡当前的数，等 60 秒，再看一次。涨幅 N 就说明平均
+ * 间隔约 60/N 秒。然后把 voc.h 的 VOC_TIMEOUT_MS 定成间隔的 3 倍以上。
+ *
+ * 顺便也能判断超时改对了没：
+ *   温度/湿度卡连续显示真值     → 超时够长，正常
+ *   真值和横杠之间反复闪        → 间隔比 VOC_TIMEOUT_MS 还长，继续加大
+ * ================================================================ */
+#define VOC_DEBUG_UI   0
+
 /* ---------- 前置声明 ---------- */
 static void on_fan_click(lv_event_t *e);
 static void on_tab(lv_event_t *e);
@@ -294,12 +308,22 @@ static void build_setting(void)
         int32_t     min, def, max;
         void      (*apply)(int32_t);
     } rows[CTL_COUNT] = {
-        { CTL_TEMP,  "温度报警阈值",   "%ld°C",  "28°C",    20,  28,   40,   apply_temp  },
-        { CTL_HUMI,  "湿度报警阈值",   "%ld%%",  "70%",     0,   70,   100,  apply_humi  },
-        { CTL_SMOKE, "烟雾报警阈值",   "%ld",    "15",      0,   15,   100,  apply_smoke },
-        { CTL_GAS,   "有毒气体报警阈值", "%ld",  "15",      0,   15,   100,  apply_gas   },
-        { CTL_LIGHT, "开灯阈值", "%ld",    "30",      0,   30,   100,  apply_light },
-        { CTL_ECO2,  "CO2报警阈值",    "%ldppm", "1000ppm", 400, 1000, 2000, apply_eco2  },
+        /* 滑块的上下限取自 app_env.h 的 CFG_*_MIN/MAX —— 那是唯一的一处
+           定义，上位机下发阈值时的钳制也用同一份（见 docs 里的 P-12：
+           同一个范围在两处各写一遍，改一边不生效且只有警告）。
+           中间的数是开机默认值，必须和 app_env.c 的 DEF_* 一致。 */
+        { CTL_TEMP,  "温度报警阈值",     "%ld°C",  "28°C",
+          (int32_t)CFG_TEMP_MIN,   28,   (int32_t)CFG_TEMP_MAX,  apply_temp  },
+        { CTL_HUMI,  "湿度报警阈值",     "%ld%%",  "70%",
+          (int32_t)CFG_HUMI_MIN,   70,   (int32_t)CFG_HUMI_MAX,  apply_humi  },
+        { CTL_SMOKE, "烟雾报警阈值",     "%ld",    "15",
+          (int32_t)CFG_SMOKE_MIN,  15,   (int32_t)CFG_SMOKE_MAX, apply_smoke },
+        { CTL_GAS,   "有毒气体报警阈值", "%ld",    "15",
+          (int32_t)CFG_GAS_MIN,    15,   (int32_t)CFG_GAS_MAX,   apply_gas   },
+        { CTL_LIGHT, "开灯阈值",         "%ld",    "30",
+          (int32_t)CFG_LIGHT_MIN,  30,   (int32_t)CFG_LIGHT_MAX, apply_light },
+        { CTL_ECO2,  "CO2报警阈值",      "%ldppm", "1000ppm",
+          (int32_t)CFG_ECO2_MIN,  1000,  (int32_t)CFG_ECO2_MAX,  apply_eco2  },
     };
 
     const lv_coord_t Y0 = 44, PITCH = 52;
@@ -467,6 +491,14 @@ static void ui_refresh_cb(lv_timer_t *t)
         lv_label_set_text(v_humi, "--%");
         lv_label_set_text(v_co2,  "---- ppm");
     }
+
+#if VOC_DEBUG_UI
+    /* 【临时调试】只顶掉 CO2 这一张，改成显示"通过校验的帧数"，用来测
+       模块的上报间隔。温度和湿度卡照常显示真值 —— 这样一次烧录能同时
+       回答两个问题：超时改对了没（看温度/湿度连不连续）、间隔是多少
+       （看这个帧数的涨幅）。排完把 VOC_DEBUG_UI 设回 0。 */
+    lv_label_set_text_fmt(v_co2, "%lu", (unsigned long)e.voc_frames_ok);
+#endif
 
     /* ---- 三张 ADC 的卡：显示 0~100 相对指数 ---- */
     lv_label_set_text_fmt(v_smoke, "%.0f", e.smoke_idx);

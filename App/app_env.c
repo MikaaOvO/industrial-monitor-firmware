@@ -22,9 +22,6 @@
 #define DEF_ECO2_HI     1000
 #define DEF_LIGHT_LO    30.0f
 
-/* 达到阈值的百分之多少就升级成"警告" */
-#define WARN_RATIO      0.8f
-
 static osMutexId_t env_mutex = NULL;
 
 static env_t g_env;     /* 只在锁内读写 */
@@ -108,6 +105,14 @@ void env_set_voc_lost(void)
     env_unlock();
 }
 
+void env_set_voc_debug(uint32_t rx_bytes, uint32_t frames_ok)
+{
+    env_lock();
+    g_env.voc_rx_bytes  = rx_bytes;
+    g_env.voc_frames_ok = frames_ok;
+    env_unlock();
+}
+
 void cfg_get(cfg_t *out)
 {
     if (out == NULL) return;
@@ -128,22 +133,29 @@ alarm_t env_alarm_level(const env_t *e, const cfg_t *c)
 {
     if (e == NULL || c == NULL) return ALARM_OK;
 
-    /* 21VOC 掉线时它那几路数据不可信，不参与报警判定 */
+    /* 21VOC 掉线时它那几路数据不可信，不参与判定 */
     bool voc = e->voc_online;
 
-    /* 优先级：气体 > CO2 > 温度/湿度。
-       气体超标是安全事件，直接报警；另外几路先判警告再判报警。
-       注意光照不在这个函数里 —— 它是"低于阈值开灯"，方向相反。 */
+    /* 注意光照不在这里 —— 它是"低于阈值就开灯"，方向相反，
+       属于控制量而不是报警量。 */
 
-    if (e->co_idx >= c->gas_hi || e->smoke_idx >= c->smoke_hi)  return ALARM_ALERT;
-    if (voc && e->eco2_ppm >= c->eco2_hi)                       return ALARM_ALERT;
-    if (voc && (e->temp_c >= c->temp_hi || e->humi_rh >= c->humi_hi)) return ALARM_ALERT;
+    /* ---- 一级：达到阈值 = 报警 ----
+       先判报警，再判警告。这样用户把阈值设得比警告门限还低时，
+       会直接跳到报警级，不会出现"先警告后报警"的倒挂。 */
+    if (e->co_idx    >= c->gas_hi)    return ALARM_ALERT;
+    if (e->smoke_idx >= c->smoke_hi)  return ALARM_ALERT;
+    if (voc && e->eco2_ppm >= c->eco2_hi)                              return ALARM_ALERT;
+    if (voc && (e->temp_c >= c->temp_hi || e->humi_rh >= c->humi_hi))  return ALARM_ALERT;
 
-    if (e->co_idx    >= c->gas_hi   * WARN_RATIO ||
-        e->smoke_idx >= c->smoke_hi * WARN_RATIO)               return ALARM_WARN;
-    if (voc && e->eco2_ppm >= (uint16_t)(c->eco2_hi * WARN_RATIO)) return ALARM_WARN;
-    if (voc && (e->temp_c >= c->temp_hi * WARN_RATIO ||
-                e->humi_rh >= c->humi_hi * WARN_RATIO))         return ALARM_WARN;
+    /* ---- 二级：接近阈值 = 警告 ----
+       用绝对值门限，不从阈值按百分比推。原因见 app_env.h 里
+       CFG_*_WARN 上面的说明：温度 0℃ / 湿度 0%RH / CO2 0ppm 都不是
+       "好状态"，按百分比算出来的警告线会把正常室温判成警告。 */
+    if (e->co_idx    >= CFG_INDEX_WARN)   return ALARM_WARN;
+    if (e->smoke_idx >= CFG_INDEX_WARN)   return ALARM_WARN;
+    if (voc && e->eco2_ppm >= CFG_ECO2_WARN)  return ALARM_WARN;
+    if (voc && e->temp_c   >= CFG_TEMP_WARN)  return ALARM_WARN;
+    if (voc && e->humi_rh  >= CFG_HUMI_WARN)  return ALARM_WARN;
 
     return ALARM_OK;
 }

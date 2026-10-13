@@ -308,7 +308,12 @@
     #define lv_snprintf  snprintf
     #define lv_vsnprintf vsnprintf
 #else   /*LV_SPRINTF_CUSTOM*/
-    #define LV_SPRINTF_USE_FLOAT 0
+    /* 打开浮点格式化。LVGL 用自己的 lv_printf.c，默认不支持 %f ——
+       一旦遇到 %f，它会走 default 分支把 'f' 原样输出，界面上就只显示
+       一个字母 f，而且掩盖了真实数值。
+       温度卡需要 "%.1f°C" 这种一位小数，所以必须开。
+       Flash 代价约 1~2KB（当前只用了 40%，无所谓）。 */
+    #define LV_SPRINTF_USE_FLOAT 1
 #endif  /*LV_SPRINTF_CUSTOM*/
 
 #define LV_USE_USER_DATA 1

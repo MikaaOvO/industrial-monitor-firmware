@@ -1,9 +1,16 @@
 #include "app_tasks.h"
 #include "app_env.h"
 #include "sensor.h"
+#include "voc.h"
+#include "host_proto.h"
+#include "indicator.h"
+#include "main.h"       /* HAL 类型 + HAL_UART_Transmit */
 #include "cmsis_os.h"
 #include "FreeRTOS.h"   /* configASSERT 在 FreeRTOSConfig.h 里 */
 #include "lvgl.h"
+
+/* CubeMX 把句柄定义在 Core/Src/main.c 里，main.h 没有 extern 声明 */
+extern UART_HandleTypeDef huart2;
 
 /* ================================================================
  * 任务骨架
@@ -14,44 +21,53 @@
 
 /* ----------------------------------------------------------------
  * 栈大小。注意 CMSIS-RTOS2 里 osThreadAttr_t.stack_size 的单位是
- * 字节，不是字 —— 384*4 才是 1.5KB。
+ * **字节**，不是字 —— 384*4 才是 1.5KB。
  *
- * 这些栈都是从 FreeRTOS 的堆里要的，而 configTOTAL_HEAP_SIZE 目前
- * 只有 15KB，所以要精打细算：
+ * 这些栈都从 FreeRTOS 的堆里出（idle 和 timer 任务走 CMSIS-RTOS2 的
+ * 静态内存，不占这个堆）。configTOTAL_HEAP_SIZE 现在是 32KB：
  *
- *     总堆                        15,360 B
- *       − LVGL 任务(8192 栈+TCB)   8,292
- *       = 剩                       7,068
- *       − 下面三个任务             5,420
- *       = 剩                       ~ 1,648 B
+ *     总堆                         32,768 B
+ *       − LVGL 任务(8192 栈+TCB)    8,292
+ *       − Sensor / Voc / Output     各 ~1.7KB
+ *       − Host                       ~2.1KB
+ *       = 剩                        ~ 16KB
  *
- * （idle 和 timer 任务走 CMSIS-RTOS2 的静态内存，不占这个堆。）
- *
- * 1.6KB 余量够将来放一个 UART 的 StreamBuffer，但如果还要加东西，
- * 就得去 CubeMX 里把 FreeRTOS → Config parameters → TOTAL_HEAP_SIZE
- * 提到 32KB。注意那个 #define 在 FreeRTOSConfig.h 的 USER CODE 区
- * 之外，手改会被 CubeMX 重新生成时覆盖，必须在图形界面里改。
+ * 余量很宽，所以栈不用抠得那么紧；真不够了 osThreadNew 只会返回 NULL
+ * 且不报错，所以 app_tasks_create() 里用 configASSERT 兜底，
+ * 另外 app_tasks_heap_left() 可以打印出来看实际剩多少。
  * ---------------------------------------------------------------- */
 #define STACK_SENSOR    (384 * 4)    /* 1.5KB：ADC 读数 + 浮点换算      */
 #define STACK_VOC       (384 * 4)    /* 1.5KB：12 字节帧解析            */
 #define STACK_HOST      (512 * 4)    /* 2.0KB：snprintf 组帧吃栈较多    */
+#define STACK_OUTPUT    (384 * 4)    /* 1.5KB：只算几个数、写寄存器     */
 
 /* ----------------------------------------------------------------
  * 优先级。数值越大优先级越高。
  * LVGL 任务（CubeMX 的 defaultTask）现在是 osPriorityNormal，
  * 可以按上面的建议调成 osPriorityAboveNormal，界面会更跟手；
  * 不改也能正常工作。
+ *
+ * 这几个业务任务绝大部分时间都阻塞着，优先级差别影响很小。只有
+ * Task_Host 给低一档 —— 它的阻塞发送一次要占 7ms 左右，排在最后
+ * 免得去抢别人。
  * ---------------------------------------------------------------- */
 #define PRIO_SENSOR     osPriorityNormal
 #define PRIO_VOC        osPriorityNormal
+#define PRIO_OUTPUT     osPriorityNormal
 #define PRIO_HOST       osPriorityBelowNormal
 
-/* 21VOC 上报间隔约 1s，超过这个时间没收到合法帧就认为掉线 */
-#define VOC_TIMEOUT_MS  3000
+/* 执行器任务的周期。风扇本身有斜率限制、界面 200ms 才刷一次，
+   100ms 足够 —— 再快只是白唤醒。 */
+#define OUTPUT_PERIOD_MS    100
+
+/* VOC_TIMEOUT_MS 定义在 voc.h 里。这里曾经又定义了一份（值不一样），
+   因为它在 #include "voc.h" 之后，把 voc.h 里的值悄悄覆盖掉了 —— 改一边
+   不生效，而且只有编译器警告能发现。协议相关的常量一律归 voc.h 管。 */
 
 static osThreadId_t sensorTaskHandle;
 static osThreadId_t vocTaskHandle;
 static osThreadId_t hostTaskHandle;
+static osThreadId_t outputTaskHandle;
 
 /* 建完任务后还剩多少 FreeRTOS 堆。堆不够时 osThreadNew 只是返回 NULL，
    不报错也不提示，是这类工程里最难查的坑之一 —— 所以留个可以打印
@@ -118,65 +134,167 @@ void Task_Sensor(void *argument)
 /* ================================================================
  * 21VOC 模块（UART4，PC11=RX / PC10=TX，9600 8N1，模块主动上报）
  *
- * 帧长固定 12 字节、帧头固定 0x2C，所以状态机很简单：
- *   找 0x2C -> 收满 12 字节 -> 校验和 -> 解析
+ * 协议、帧格式、手册里那两个坑（*28 其实是 *256、负温度编码差 1），
+ * 以及 ISR 与任务的分工，全都写在 App/voc.c 里了。这个任务本身只负责：
  *
- * 接收不要用阻塞式 HAL_UART_Receive。正确做法：
- *   HAL_UARTEx_ReceiveToIdle_DMA() 启动接收，
- *   IDLE 中断里把整帧丢进 StreamBuffer / MessageQueue，
- *   这个任务阻塞在上面等。中断里只搬字节，不做解析。
+ *   进循环前：voc_start() 启动单字节中断接收（之后中断自维持）
+ *   循环里：  每 20ms 看一次有没有收满一帧 ->
+ *             有就校验+解析，成功写 env_set_voc()；
+ *             连续 VOC_TIMEOUT_MS 没拿到合法帧就 env_set_voc_lost()，
+ *             界面会回落到占位符，而不是继续显示过期数据。
  *
- * 帧结构（D[n] 是第 n 个字节）：
- *   D[0]      帧头 0x2C
- *   D[1..2]   VOC      ug/m3    = D[1]<<8 | D[2]
- *   D[3..4]   甲醛     ug/m3    = D[3]<<8 | D[4]
- *   D[5..6]   eCO2     ppm      = D[5]<<8 | D[6]
- *   D[7..8]   温度     0.1℃     = D[7]<<8 | D[8]
- *   D[9..10]  湿度     0.1%RH   = D[9]<<8 | D[10]
- *   D[11]     校验和 = 前 11 字节累加和取反 +1
- *
- * 两个坑：
- *   1) 手册印的是 *28，实际是 *256（PDF 把 2^8 的上标吃掉了）。
- *      用手册自己的例子验证：0x013D = 0x01*256+0x3D = 317 = 31.7℃，
- *      按 *28 算只有 89，对不上。
- *   2) 负温度编码和标准补码差 1：手册规则是"最高位为 1 表示零下，
- *      幅度 = 0xFFFF - 原始值"（-10 记作 0xFFF5）。
- *      按标准 int16 补码读 0xFFF5 会得到 -11。
- *      按手册规则实现，室内监测基本遇不到零下。
+ * 为什么用轮询而不是在中断里通知任务：这样中断里完全不碰 FreeRTOS 的
+ * API，和优先级约束彻底解耦。帧每秒才来一帧，20ms 的延迟无所谓。
  * ================================================================ */
 void Task_Voc(void *argument)
 {
     (void)argument;
 
-    for (;;) {
-        /* TODO: 阻塞等一帧 -> 校验 -> 解析 -> env_set_voc(...)
-                 超时 VOC_TIMEOUT_MS 没收到就 env_set_voc_lost() */
+    bool uart_ok = voc_start();
+    configASSERT(uart_ok);
+    (void)uart_ok;
 
-        osDelay(1000);      /* 骨架：先空转，接上 UART4 后删掉这行 */
+    uint32_t silent_ms = 0;
+
+    for (;;) {
+        uint8_t frame[VOC_FRAME_LEN];
+        bool got_good = false;
+
+        if (voc_take_frame(frame)) {
+            voc_data_t d;
+            if (voc_parse(frame, &d)) {
+                env_set_voc(d.temp_c, d.humi_rh,
+                            d.eco2_ppm, d.voc_ugm3, d.hcho_ugm3);
+                voc_note_ok_frame();
+                got_good = true;
+            }
+            /* 校验不过就当作"没收到"处理，下面照常计时。
+               注意别在这里提前 continue，否则一连串的错帧永远不会
+               触发掉线判定，界面会一直挂着最后一次的好数据。 */
+        }
+
+        /* 把诊断计数器同步给界面（临时调试用，见 ui.c 的 VOC_DEBUG_UI） */
+        env_set_voc_debug(voc_rx_bytes(), voc_frames_ok());
+
+        if (got_good) {
+            silent_ms = 0;
+        } else {
+            silent_ms += VOC_POLL_MS;
+            if (silent_ms >= VOC_TIMEOUT_MS) {
+                env_set_voc_lost();
+            }
+        }
+
+        osDelay(VOC_POLL_MS);
     }
 }
 
 /* ================================================================
  * 上位机通信（USART2，PA2=TX / PA3=RX，115200 8N1，接 CH340）
  *
- * 一个串口既要发遥测又要收阈值命令，收发分两条路：
- *   发：每 500ms 取 env/cfg 快照，组帧，发出去
- *   收：字节进 StreamBuffer，这里跑状态机分帧 -> 校验 -> cfg_set()
+ * 帧格式、字段含义、校验算法都在 App/host_proto.c 里。这个任务只负责：
  *
- * 组帧建议带 node 字段和 CRC —— 台账里 RS485 组网是预留项，
- * 现在就把格式定好，将来换物理层不用动上层代码。
+ *   进循环前：host_start() 启动接收中断（之后中断自维持，见 uart_rx.c）
+ *   循环里：  ① 收到整行就解析，成功的命令写回共享 cfg
+ *             ② 每 HOST_SEND_MS 组一帧遥测发出去
  *
- * 注意：收到阈值后写 cfg_set() 就行，界面会在 200ms 内自己同步，
- *       这个任务不要碰任何 lv_* 函数。
+ * ---- 收发为什么不对称 ----
+ *   收必须靠中断：115200 下一个字节只有 87µs，20ms 轮询一次中间会到
+ *   200 多个字节，只能捞到 1 个，一帧都收不全。
+ *   发是主动的、每 500ms 一次，用阻塞发送最简单 —— 80 字节在 115200 下
+ *   约 7ms，相对于 500ms 周期可以接受，而且这段时间正好不会去抢 LVGL。
+ *
+ * ---- 边界 ----
+ *   收到阈值后写 cfg_set() 就行，界面会在 200ms 内自己同步过来。
+ *   这个任务**不要碰任何 lv_* 函数**（LVGL 不是线程安全的）。
  * ================================================================ */
+
+/* 循环周期。取 5ms 而不是 20ms 的原因：行缓冲只有一个槽位，如果两条命令
+   在同一个轮询窗口内都收满，前一条会被后一条覆盖掉。115200 下一条 40 字节
+   的命令约 3.5ms，两条之间至少隔 7ms，所以 5ms 的窗口里塞不下两条 ——
+   这样"上位机连着发多条命令"就不会丢。
+   （代价是每秒 200 次唤醒，每次只查一个标志位，可以忽略。） */
+#define HOST_POLL_MS     5
+#define HOST_SEND_MS     500    /* 遥测上报周期 */
+#define HOST_TX_TIMEOUT  100    /* 阻塞发送的超时 ms */
+#define HOST_NODE_ID     1      /* 节点号。现在恒为 1，给 RS485 组网预留 */
+
 void Task_Host(void *argument)
 {
     (void)argument;
 
-    for (;;) {
-        /* TODO: 组帧上报 + 解析上位机下发的阈值命令 */
+    bool uart_ok = host_start();
+    configASSERT(uart_ok);      /* 失败十有八九是 CubeMX 里 USART2 的中断没勾 */
+    (void)uart_ok;
 
-        osDelay(500);
+    /* 帧缓冲放静态区，别放栈上 —— Task_Host 的栈只有 2KB，
+       192 字节的帧加上 printf 系的内部占用会很紧张。 */
+    static char txbuf[HOST_TX_BUF_LEN];
+    char line[HOST_RX_LINE_LEN];
+
+    uint32_t since_send = 0;
+
+    for (;;) {
+        /* ---- ① 收：有整行就解析 ---- */
+        if (host_take_line(line, sizeof line)) {
+            cfg_t c;
+            cfg_get(&c);
+            if (host_parse_cmd(line, &c)) {
+                cfg_set(&c);        /* 校验通过的合法命令才写回去 */
+            }
+            /* 解析失败（校验错、格式错）就无声丢弃。
+               不要在失败时去改 cfg —— 一帧被干扰的命令绝不能改坏一半参数。 */
+        }
+
+        /* ---- ② 发：每 HOST_SEND_MS 一帧遥测 ---- */
+        since_send += HOST_POLL_MS;
+        if (since_send >= HOST_SEND_MS) {
+            since_send = 0;
+
+            env_t e;
+            cfg_t c;
+            env_get(&e);
+            cfg_get(&c);
+
+            int n = host_build_telemetry(txbuf, sizeof txbuf, HOST_NODE_ID, &e, &c);
+            if (n > 0) {
+                HAL_UART_Transmit(&huart2, (uint8_t *)txbuf, (uint16_t)n, HOST_TX_TIMEOUT);
+            }
+            /* 发送失败（超时）不做重试：500ms 后本来就有下一帧，
+               重试只会把过期的数据补发一遍。 */
+        }
+
+        osDelay(HOST_POLL_MS);
+    }
+}
+
+/* ================================================================
+ * 执行器输出（风扇，以后加灯光）
+ *
+ * 单独一个任务而不是塞进 Task_Sensor，是为了把"采样进"和"执行出"分开：
+ * 两者出错的原因和排查方式完全不同，混在一起以后会越来越难读。
+ *
+ * 具体怎么算占空比、斜率限制多少，都在 App/indicator.c 里。这个任务
+ * 只负责按周期取一次快照、调一次更新。
+ *
+ * 注意：它写的是 TIM1 的寄存器，不碰 LVGL —— 界面那边由 ui.c 的
+ * 定时器自己刷，两者通过共享数据解耦。
+ * ================================================================ */
+void Task_Output(void *argument)
+{
+    (void)argument;
+
+    indicator_init();
+
+    for (;;) {
+        env_t e;
+        cfg_t c;
+        env_get(&e);
+        cfg_get(&c);
+
+        indicator_update(&e, &c);
+
+        osDelay(OUTPUT_PERIOD_MS);
     }
 }
 
@@ -200,10 +318,16 @@ void app_tasks_create(void)
         .stack_size = STACK_HOST,
         .priority   = (osPriority_t)PRIO_HOST,
     };
+    const osThreadAttr_t outputAttr = {
+        .name       = "OutputTask",
+        .stack_size = STACK_OUTPUT,
+        .priority   = (osPriority_t)PRIO_OUTPUT,
+    };
 
     sensorTaskHandle = osThreadNew(Task_Sensor, NULL, &sensorAttr);
     vocTaskHandle    = osThreadNew(Task_Voc,    NULL, &vocAttr);
     hostTaskHandle   = osThreadNew(Task_Host,   NULL, &hostAttr);
+    outputTaskHandle = osThreadNew(Task_Output, NULL, &outputAttr);
 
     s_heap_left = xPortGetFreeHeapSize();
 
@@ -213,6 +337,7 @@ void app_tasks_create(void)
     configASSERT(sensorTaskHandle != NULL);
     configASSERT(vocTaskHandle    != NULL);
     configASSERT(hostTaskHandle   != NULL);
+    configASSERT(outputTaskHandle != NULL);
 }
 
 /* 建完任务后剩余的 FreeRTOS 堆字节数（给 Task_Host 上报用） */

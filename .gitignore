@@ -13,6 +13,16 @@
 *.a
 *.lib
 
+# ---- 主机侧单元测试（不纳入版本管理，只在本机跑） ----
+# tests/ 下是 test_host_proto.c 和 run.sh，用 `sh tests/run.sh` 跑 ——
+# 在 PC 上用主机 gcc 编出协议层并执行 76 项断言，不碰固件工具链、不用烧板子。
+# 不提交的理由：开发期的自查工具，不算交付物。
+# 注意前导斜杠：/tests/ 锚定仓库根目录，写成 tests/ 会把别处同名目录也吃掉。
+/tests/
+
+# 散落的可执行文件（MinGW/cygwin 编出来的）
+*.exe
+
 # ---- CubeMX 临时文件 ----
 mx.scratch
 

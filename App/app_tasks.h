@@ -17,9 +17,10 @@ void Task_Lvgl(void *argument);
 void Task_Sensor(void *argument);
 void Task_Voc(void *argument);
 void Task_Host(void *argument);
+void Task_Output(void *argument);
 
 /* 在 main.c 的 "USER CODE BEGIN RTOS_THREADS" 里调一次。
-   创建 Sensor / Voc / Host 三个任务（LVGL 任务由 CubeMX 的
+   创建 Sensor / Voc / Host / Output 四个任务（LVGL 任务由 CubeMX 的
    defaultTask 承担，不重复创建）。 */
 void app_tasks_create(void);
 
